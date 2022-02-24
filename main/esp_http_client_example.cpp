@@ -55,10 +55,6 @@
 #include "driver/sdmmc_host.h"
 #endif
 
-// USART
-#include "driver/uart.h"
-#include "driver/gpio.h"
-
 
 #define HTTP_FILE_DOWNLOAD 1
 #define HTTP_FILE_PRINT 2
@@ -69,87 +65,12 @@
 
 // static const char *TAG = "example";
 
-static const char *TAG = "HTTP_CS_SD";
+#define MOUNT_POINT "/sdcard"
 
 #define MAX_HTTP_RECV_BUFFER 512
 #define MAX_HTTP_OUTPUT_BUFFER 2048
+static const char *TAG = "HTTP_CLIENT_SERVER";
 
-
-TaskHandle_t* task_handle_client;
-TaskHandle_t* taskhandle1;
-
-char download_filename[50] = {};
-char download_file_httpaddr[200] = {};
-
-typedef struct divi
-{
-    /* data */
-    char cmd[10];
-    char content_1[100];
-    char content_2[100];
-
-}div_str;
-
-
-// UART INIT
-static const int RX_BUF_SIZE = 1024;
-
-#define TXD_PIN (GPIO_NUM_17)
-#define RXD_PIN (GPIO_NUM_5)
-
-void xc_usar_tinit(void) {
-    const uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_APB,
-    };
-    // We won't use a buffer for sending data.
-    uart_driver_install(UART_NUM_2, RX_BUF_SIZE * 2, 0, 0, NULL, 0);
-    uart_param_config(UART_NUM_2, &uart_config);
-    uart_set_pin(UART_NUM_2, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-}
-
-
-int sendData(const char* logName, const char* data)
-{
-    const int len = strlen(data);
-    const int txBytes = uart_write_bytes(UART_NUM_2, data, len);
-    ESP_LOGI(logName, "Wrote %d bytes", txBytes);
-    return txBytes;
-}
-
-static void tx_task(void *arg)
-{
-    static const char *TX_TASK_TAG = "TX_TASK";
-    esp_log_level_set(TX_TASK_TAG, ESP_LOG_INFO);
-    while (1) {
-        sendData(TX_TASK_TAG, "Hello world");
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
-    }
-}
-
-static void rx_task(void *arg)
-{
-    static const char *RX_TASK_TAG = "RX_TASK";
-    esp_log_level_set(RX_TASK_TAG, ESP_LOG_INFO);
-    uint8_t* data = (uint8_t*) malloc(RX_BUF_SIZE+1);
-    while (1) {
-        const int rxBytes = uart_read_bytes(UART_NUM_2, data, RX_BUF_SIZE, 1000 / portTICK_RATE_MS);
-        if (rxBytes > 0) {
-            data[rxBytes] = 0;
-            ESP_LOGI(RX_TASK_TAG, "Read %d bytes: '%s'", rxBytes, data);
-            ESP_LOG_BUFFER_HEXDUMP(RX_TASK_TAG, data, rxBytes, ESP_LOG_INFO);
-        }
-    }
-    free(data);
-}
-
-
-
-#define MOUNT_POINT "/sdcard"
 #ifndef SPI_DMA_CHAN
 #define SPI_DMA_CHAN    1
 #endif //SPI_DMA_CHAN
@@ -161,15 +82,18 @@ static void rx_task(void *arg)
 
 #define USE_SPI_MODE
 
-// esp_vfs_fat_sdmmc_mount_config_t mount_config;
+esp_vfs_fat_sdmmc_mount_config_t mount_config;
 sdmmc_card_t *card;
 const char mount_point[] = MOUNT_POINT;
 sdmmc_host_t host;
-spi_bus_config_t bus_cfg;
 sdspi_device_config_t slot_config;
 
+TaskHandle_t* task_handle_client;
+TaskHandle_t* taskhandle1;
 
-// sd init
+char download_filename[50] = {};
+char download_file_httpaddr[100] = {};
+
 void xc_sd_init(void)
 {
     esp_err_t ret;
@@ -192,7 +116,29 @@ void xc_sd_init(void)
     // Note: esp_vfs_fat_sdmmc/sdspi_mount is all-in-one convenience functions.
     // Please check its source code and implement error recovery when developing
     // production applications.
+#ifndef USE_SPI_MODE
+    ESP_LOGI(TAG, "Using SDMMC peripheral");
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
 
+    // This initializes the slot without card detect (CD) and write protect (WP) signals.
+    // Modify slot_config.gpio_cd and slot_config.gpio_wp if your board has these signals.
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+
+    // To use 1-line SD mode, uncomment the following line:
+    // slot_config.width = 1;
+
+    // GPIOs 15, 2, 4, 12, 13 should have external 10k pull-ups.
+    // Internal pull-ups are not sufficient. However, enabling internal pull-ups
+    // does make a difference some boards, so we do that here.
+    gpio_set_pull_mode(15, GPIO_PULLUP_ONLY);   // CMD, needed in 4- and 1- line modes
+    gpio_set_pull_mode(2, GPIO_PULLUP_ONLY);    // D0, needed in 4- and 1-line modes
+    gpio_set_pull_mode(4, GPIO_PULLUP_ONLY);    // D1, needed in 4-line mode only
+    gpio_set_pull_mode(12, GPIO_PULLUP_ONLY);   // D2, needed in 4-line mode only
+    gpio_set_pull_mode(13, GPIO_PULLUP_ONLY);   // D3, needed in 4- and 1-line modes
+
+    ESP_LOGI(TAG, "Mounting filesystem");
+    ret = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
+#else
     ESP_LOGI(TAG, "Using SPI peripheral");
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
@@ -217,19 +163,7 @@ void xc_sd_init(void)
     slot_config.host_id = host.slot;
 
     ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
-
-
-    if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            ESP_LOGE(TAG, "Failed to mount filesystem. "
-                     "If you want the card to be formatted, set the EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
-        } else {
-            ESP_LOGE(TAG, "Failed to initialize the card (%s). "
-                     "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
-        }
-        return;
-    }
-    ESP_LOGI(TAG, "Filesystem mounted");
+#endif //USE_SPI_MODE
 }
 
 // HTTP CLIENT
@@ -272,10 +206,10 @@ esp_err_t _http_event_handler(esp_http_client_event_t *evt)
              */
             if (!esp_http_client_is_chunked_response(evt->client)) {
                 // If user_data buffer is configured, copy the response into the buffer
-                char open_file_name[100] = {0};                
-                sprintf(open_file_name, "%s/%s", MOUNT_POINT, download_filename);
-                ESP_LOGI(TAG, "open_file_name in download %s", open_file_name);
-                FILE *f = fopen(open_file_name, "a+");
+                char open_file_name[50] = {0};                
+                sprintf(open_file_name, "%s%s", MOUNT_POINT, download_filename);
+
+                FILE *f = fopen(open_file_name, "wb+");
                 if (f == NULL) {
                     ESP_LOGE(TAG, "Failed to open file for writing");
                     return;
@@ -686,25 +620,22 @@ static void http_redirect_to_https(void)
 
 static void http_download_chunk(void)
 {   
-    char open_file_name[100] = {};
+    char open_file_name[50] = {};
 
     ESP_LOGI(TAG, "\n*****http_download_chunk*****\n");
     ESP_LOGI(TAG, "Opening file");
     // FILE *f = fopen(MOUNT_POINT"/logo.jpg", "wb+");
+    
+    sprintf(open_file_name, "%s%s", MOUNT_POINT, download_filename);
 
-    sprintf(open_file_name, "%s/%s", MOUNT_POINT, download_filename);
-    ESP_LOGI(TAG, "open file name -> %s\n", open_file_name);
-
-    // xc_sd_init();
-
-
-    FILE *f = fopen(open_file_name, "w+");
+    FILE *f = fopen(open_file_name, "wb+");
     if (f == NULL) {
         ESP_LOGE(TAG, "Failed to open file for writing");
         return;
     }
     fclose(f);
 
+    esp_err_t ret;
     esp_http_client_config_t config = {
         // .url = "http://xindongwang-1305342772.cos.ap-shenzhen-fsi.myqcloud.com/cn/logo.jpg",
         .url = download_file_httpaddr,
@@ -723,12 +654,13 @@ static void http_download_chunk(void)
     }
     esp_http_client_cleanup(client);
 
-    // ESP_LOGI(TAG, "File written");
-    // // All done, unmount partition and disable SDMMC or SPI peripheral
-    // esp_vfs_fat_sdcard_unmount(mount_point, card);
-    // ESP_LOGI(TAG, "Card unmounted");
+    
+    ESP_LOGI(TAG, "File written");
+    // All done, unmount partition and disable SDMMC or SPI peripheral
+    esp_vfs_fat_sdcard_unmount(mount_point, card);
+    ESP_LOGI(TAG, "Card unmounted");
 
-    // //deinitialize the bus after all devices are removed
+    //deinitialize the bus after all devices are removed
     // spi_bus_free(host.slot);
 }
 
@@ -975,7 +907,7 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
      * extra byte for null termination */
     buf_len = httpd_req_get_hdr_value_len(req, "Host") + 1;
     if (buf_len > 1) {
-        buf = (char *)malloc(buf_len);
+        buf = malloc(buf_len);
         /* Copy null terminated value string into buffer */
         if (httpd_req_get_hdr_value_str(req, "Host", buf, buf_len) == ESP_OK) {
             ESP_LOGI(TAG, "Found header => Host: %s", buf);
@@ -985,7 +917,7 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
 
     buf_len = httpd_req_get_hdr_value_len(req, "Test-Header-2") + 1;
     if (buf_len > 1) {
-        buf = (char *)malloc(buf_len);
+        buf = malloc(buf_len);
         if (httpd_req_get_hdr_value_str(req, "Test-Header-2", buf, buf_len) == ESP_OK) {
             ESP_LOGI(TAG, "Found header => Test-Header-2: %s", buf);
         }
@@ -994,7 +926,7 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
 
     buf_len = httpd_req_get_hdr_value_len(req, "Test-Header-1") + 1;
     if (buf_len > 1) {
-        buf = (char *)malloc(buf_len);
+        buf = malloc(buf_len);
         if (httpd_req_get_hdr_value_str(req, "Test-Header-1", buf, buf_len) == ESP_OK) {
             ESP_LOGI(TAG, "Found header => Test-Header-1: %s", buf);
         }
@@ -1005,7 +937,7 @@ static esp_err_t hello_get_handler(httpd_req_t *req)
      * extra byte for null termination */
     buf_len = httpd_req_get_url_query_len(req) + 1;
     if (buf_len > 1) {
-        buf = (char *)malloc(buf_len);
+        buf = malloc(buf_len);
         if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
             ESP_LOGI(TAG, "Found URL query => %s", buf);
             char param[32];
@@ -1050,137 +982,21 @@ static const httpd_uri_t hello = {
 };
 
 static int find_first_char(char*buf, int buf_len, char c){
-    int i = 0;
-    for(i = 0; i < buf_len; i++){
+    for(int i = 0; i < buf_len; i++){
         if(buf[i] == c){
             return i;
         }
     }  
-    i = -1;
-    return i;
-}
-
-// replace str in a str to the other str
-void str_replace(char *str_src, int n, char * str_copy)
-{
-	int lenofstr;
-	int i;
-	char *tmp;
-	lenofstr = strlen(str_copy); 
-	//string to copy is shorter than string to find
-	if(lenofstr < n)  
-	{
-		tmp = str_src+n;
-		while(*tmp)
-		{
-			*(tmp-(n-lenofstr)) = *tmp; //n-lenofstr, length of moving
-			tmp++;
-		}
-		*(tmp-(n-lenofstr)) = *tmp; //move '\0'	
-	}
-	else if(lenofstr > n) //string to copy longer than string to find
-	{
-		tmp = str_src;
-		while(*tmp) tmp++;
-		while( tmp>=(str_src+n) )
-		{
-			*(tmp+(lenofstr-n)) = *tmp;
-			tmp--;
-		}   
-	}
-	strncpy(str_src, str_copy, lenofstr);
-
-}
-
-char str_content1[100] = {0};
-char str_content2[100] = {0};
-char str_content3[100] = {0};;
-// divi str with the character, if none, return 0   
-// str will divi begin from the first one
-// str_content[c_index+1][]
-static int divi_str_with_one_char(char*buf, int buf_len, char c, char** str_content){
-    int i = 0;
-    i = find_first_char(buf, buf_len, c);;
-    if(i == -1){
-        return -1;
-    }
-    strncpy(str_content[0], buf, i);
-
-    strcpy(str_content[1], buf+strlen(str_content1)+1);
-    
-    return i;
-}
-
-static int divi_str_with_two_char(char*buf, int buf_len, char c){
-
-    int i = 0;
-    i = find_first_char(buf, buf_len, c);
-    if(i < 0){
-        return -1;
-    }
-    strncpy(str_content1, buf, i);
-    ESP_LOGI(TAG, "str_content %s", str_content1);
-
-    i = find_first_char(buf+i+1, buf_len-i-1, c);
-    if(i < 0){
-        return -1;
-    }
-    strncpy(str_content2, buf+i+1, i);
-    ESP_LOGI(TAG, "str_content %s", str_content2);
-
-    strcpy(str_content3, buf+i+1+strlen(str_content2)+1);
-    ESP_LOGI(TAG, "str_content %s", str_content3);
-    return i;
-}
-
-
-static int divi_str_with_two_char1(char*buf, int buf_len, char c, div_str* strs){
-    int c_index1 = 0, c_index2 =0;
-    char* str1 = NULL;
-    char* str2 = NULL;
-
-    // cmd 
-    c_index1 = find_first_char(buf, buf_len, c);
-    if(c_index1 < 0){
-        return -1;
-    }
-    strncpy(strs->cmd, buf, c_index1+1);
-    strs->cmd[c_index1] = 0;
-
-    // content1
-    str1 = buf+c_index1+1;
-    c_index2 = find_first_char(str1, buf_len-(c_index1+1), c);
-    if(c_index2 < 0){
-        return -1;
-    }
-    strncpy(strs->content_1, str1, c_index2+1);
-    strs->content_1[c_index2] = 0;
-
-    // content2
-    str2 = str1+c_index2+1;
-    if(strlen(str2)>100 || strlen(str2) < 1){
-        return -1;
-    }
-    strcpy(strs->content_2, str2);
-
-    return c_index2;
-    
 }
 
 static int echo_post_parse(char *buf, int buf_len){
     
     char cmd, i;
     char temp_str[10] = {0};
-    char buf_temp[200] = {0};
 
-    i = find_first_char(buf, buf_len, '=');
-    // if(i == 0){
-    //     return 0;
-    // }
-    ESP_LOGI(TAG, "ECHO POST PARSE %d", i);;
+    i = find_first_char(buf, buf_len, ':');
 
     strncpy(temp_str, buf, i);
-    ESP_LOGI(TAG, "ECHO POST PARSE buf-> %s", temp_str);;
 
     if(!strcmp("download", temp_str)){
         cmd = HTTP_FILE_DOWNLOAD;
@@ -1196,40 +1012,6 @@ static int echo_post_parse(char *buf, int buf_len){
         cmd = 0;
     }
 
-    char str_find_3D[5] = "%3D";
-    char str_find_3A[5] = "%3A";
-    char str_find_2F[5] = "%2F";
-    char* p = NULL;
-
-    // 3D -> =
-    p = strstr(buf, str_find_3D);
-	while(p){
-		
-		str_replace(p, strlen(str_find_3D), (char *)"=");
-		p = p + strlen("=");
-		p = strstr(p, str_find_3D);
-	}
-
-    // 3A -> :
-    p = strstr(buf, str_find_3A);
-	while(p){
-		
-		str_replace(p, strlen(str_find_3A), (char *)":");
-		p = p + strlen(":");
-		p = strstr(p, str_find_3A);
-	}
-
-    // 2F -> /
-    p = strstr(buf, str_find_2F);
-	while(p){
-		
-		str_replace(p, strlen(str_find_2F), (char *)"/");
-		p = p + strlen("/");
-		p = strstr(p, str_find_2F);
-	}
-    
-
-    ESP_LOGI(TAG, "ECHO POST PARSE CMD %d", cmd);
     return cmd;
 }
 
@@ -1263,54 +1045,25 @@ static esp_err_t echo_post_handler(httpd_req_t *req)
         ESP_LOGI(TAG, "====================================");
 
         post_cmd = echo_post_parse(buf, sizeof(buf));
-        ESP_LOGI(TAG, "post_cmd %d", post_cmd);
-
         /* if post message is "download"*/
         if(post_cmd == HTTP_FILE_DOWNLOAD){
-            char tempbuf[200] = {0};
+            char tempbuf[150];
             char location;
-            char* pos;
             //"download:filename:address"
             // start task client  to down load file
-            // if(eDeleted != eTaskGetState("http_client_task")){
-            //     vTaskDelete(task_handle_client);
-            // }
-            div_str download_div_str;
-            
-            location = divi_str_with_two_char1(buf, sizeof(buf), '=', &download_div_str);
-            // if(location == -1){
-            //     return ESP_FAIL;
-            // }
-            ESP_LOGI(TAG, "str_content[0] -> %s",  download_div_str.cmd);
-            ESP_LOGI(TAG, "str_content[1] -> %s",  download_div_str.content_1);
-            ESP_LOGI(TAG, "str_content[2] -> %s",  download_div_str.content_2);
+            if(eDelete != eTaskGetState("http_client_task")){
+                vTaskDelete(task_handle_client);
+            }
 
-            strcpy(download_filename, download_div_str.content_1);
-            ESP_LOGI(TAG, "DOWNLOAD FILE NAME -> %s",  download_filename);
+            strcpy(tempbuf, buf+strlen("download:")+1);
+            location = find_first_char(tempbuf, sizeof(buf) - strlen("download:"), ':');
 
-            // if(strlen(download_div_str.content_2) > 100 || strlen(download_div_str.content_2)<5)
-            //     return ESP_FAIL;
+            strncpy(download_filename, tempbuf, location);
+            strcpy(download_file_httpaddr, tempbuf+location+1);
 
-            strcpy(download_file_httpaddr, download_div_str.content_2);
-            pos = strstr(download_file_httpaddr, download_filename);
-            strcpy(pos, download_filename);
-            ESP_LOGI(TAG, "DOWNLOAD FILE ADDR-> %s\n", download_file_httpaddr);
-
-            // strcpy(tempbuf, buf+strlen("download:"));
-            // ESP_LOGI(TAG, "tempbuf ->%s",tempbuf);
-            // location = find_first_char(tempbuf, sizeof(buf) - strlen("download:"), ':');
-            
-            // strncpy(download_filename, tempbuf, location);
-            // ESP_LOGI(TAG, "DOWNLOAD FILE NAME -> %s",  download_filename);
-
-            // // find name str,and repalce the str(in case the final str is wrong)
-            // strcpy(download_file_httpaddr, tempbuf+strlen(download_filename)+1);
-            // pos = strstr(download_file_httpaddr, download_filename);
-            // strcpy(pos, download_filename);
-            // ESP_LOGI(TAG, "DOWNLOAD FILE ADDR-> %s\n", download_file_httpaddr);
-
+            xc_sd_init();
             xTaskCreate(&http_client_task, "http_client_task", 8192, NULL, 5, task_handle_client);
-        }else return ESP_FAIL;
+        }
         /* else if ... */
         //
 
@@ -1349,9 +1102,6 @@ static httpd_handle_t start_webserver(void)
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
-    ESP_LOGI(TAG, "Starting server on max_resp_headers: '%d'", config.max_resp_headers);
-    config.max_resp_headers = 1024;
-    // config.server_port = 80;
 
     // Start the httpd server
     ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
@@ -1405,7 +1155,10 @@ static void http_server_task(void *pvParameters)
 }
 
 
-void http_part(void)
+
+extern void xc_sd_init(void);
+
+void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1414,32 +1167,15 @@ void http_part(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /*  
-    xc_sd_init  spi-mode -> sd
-    #define PIN_NUM_MISO 19
-    #define PIN_NUM_MOSI 23
-    #define PIN_NUM_CLK  18
-    #define PIN_NUM_CS   5
-    
-    idf.py menuconfig
-    =====================
-    (Top) --->Component config --->FAT Filesystem support
-
-    fat:long filename support in heap(255)
-    =====================
+    /*
+        xc_sd_init  spi-mode -> sd
+        #define PIN_NUM_MISO 19
+        #define PIN_NUM_MOSI 23
+        #define PIN_NUM_CLK  18
+        #define PIN_NUM_CS   5
     */
     xc_sd_init();
 
-    /*
-        idf.py menuconfig
-        =====================
-        (TOP)--->Example Connection Configuration
-        (SZChaoFan) WiFi SSID
-        (ChaoFan2021) WiFi Password
-        (TOP)--->Component config ---> HTTP Server
-        max header lenth: 2048
-        =====================
-    */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -1450,9 +1186,9 @@ void http_part(void)
     ESP_ERROR_CHECK(example_connect());
     ESP_LOGI(TAG, "Connected to AP, begin http example");
 
-
+    // xTaskCreate(&http_server_task, "http_server_task", 8192, NULL, 4, NULL);
+    // http_server_task();
     static httpd_handle_t server = NULL;
     ESP_LOGI(TAG, "HTTP SERVER TASK");
     server = start_webserver();
-
 }

@@ -39,7 +39,7 @@ void app_main(void)
     (tx -> 3d printer board)
     (rx <- 3d printer board)
     */
-    usart_part();
+    // usart_part();
 
 }
 
